@@ -1,0 +1,7 @@
+{
+  "name": "EagleEye Lima - Urban Security AI",
+  "description": "Advanced AI-powered security system for the Jesús María district, detecting license plates, motorcycles, and weapons in real-time.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
