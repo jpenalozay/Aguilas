@@ -3,7 +3,7 @@ uvicorn[standard]==0.27.0
 aiortc==1.8.0
 opencv-python-headless==4.9.0.80
 numpy==1.26.3
-pytesseract==0.3.10
+easyocr==1.7.2
 inference-sdk==0.9.15
 python-multipart==0.0.6
 aiohttp==3.9.1

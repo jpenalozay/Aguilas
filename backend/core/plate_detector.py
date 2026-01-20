@@ -2,77 +2,89 @@
 import asyncio
 import cv2
 import numpy as np
-import pytesseract
-import re
 import os
+import easyocr
+import logging
 from typing import Dict, Any, Tuple
 from inference_sdk import InferenceHTTPClient
+
+# Suppress EasyOCR Logs (if any)
+logging.getLogger("easyocr").setLevel(logging.ERROR)
 
 # Configuración Roboflow
 API_URL = "https://serverless.roboflow.com"
 API_KEY = "Xekc75ienOgW1yGih9US"
 MODEL_ID = "deteccion-de-placas-peruanas-ybiq9/2"
 
-# initialize client once
+# Initialize Roboflow Client
 client = InferenceHTTPClient(api_url=API_URL, api_key=API_KEY)
 
-def extract_plate_text_sync(img: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[str, float]:
+# Initialize EasyOCR (Global Singleton)
+# 'en' covers text. gpu=False by default to be safe, but True if available.
+# We will disable gpu explicitely to avoid CUDA vs CPU issues unless user has setup.
+# Actually, let's let EasyOCR decide (default is True if available).
+reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+
+def run_easy_ocr_sync(img: np.ndarray) -> Tuple[str, float]:
     """
-    Synchronous OCR logic using Tesseract.
+    Synchronous EasyOCR inference.
     """
-    x, y, w, h = bbox
-    # Ensure coordinates are within image bounds
-    height, width = img.shape[:2]
-    x1, y1 = max(0, int(x - w/2)), max(0, int(y - h/2))
-    x2, y2 = min(width, int(x + w/2)), min(height, int(y + h/2))
-    
-    padding = 10
-    x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
-    x2, y2 = min(width, x2 + padding), min(height, y2 + padding)
-    
-    plate_img = img[y1:y2, x1:x2]
-    if plate_img.size == 0: return "", 0.0
-    
-    # Image Preprocessing
-    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-    scale = 4.0
-    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    gray = clahe.apply(gray)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-'
     try:
-        text = pytesseract.image_to_string(binary, config=custom_config).strip().upper()
-        # Cleaning
-        text = re.sub(r'[^A-Z0-9-]', '', text)
-        if len(text) >= 4:
-            if '-' not in text and len(text) >= 6: text = text[:3] + '-' + text[3:6]
-            return text, 0.85
+        # EasyOCR expects RGB or BGR. 
+        # readtext returns a list of tuples: (bbox, text, prob)
+        result = reader.readtext(img)
+        
+        # Check if any text detected
+        if not result:
+            return "", 0.0
+            
+        # Select the best result (highest confidence or longest string?)
+        # For plates, usually the single main text block.
+        best_text = ""
+        best_conf = 0.0
+        
+        for (bbox, text, prob) in result:
+            if prob > best_conf:
+                best_conf = prob
+                best_text = text
+                
+        # Clean text
+        import re
+        clean_text = re.sub(r'[^A-Z0-9-]', '', best_text.upper())
+        
+        if len(clean_text) >= 3:
+             # Basic formatting for Peru-style if needed
+             if '-' not in clean_text and len(clean_text) == 6:
+                 clean_text = clean_text[:3] + '-' + clean_text[3:]
+                 
+             return clean_text, best_conf
+
     except Exception as e:
-        print(f"OCR Error: {e}")
-        pass
+        print(f"EasyOCR Error: {e}")
+    
     return "", 0.0
 
 def run_roboflow_inference_sync(img: np.ndarray) -> Any:
     """
     Synchronous wrapper for Roboflow inference. 
-    Writes temp file because SDK might perform better or require file path in some versions.
     """
     temp_filename = f"temp_{os.getpid()}_{np.random.randint(0,10000)}.jpg"
-    cv2.imwrite(temp_filename, img)
     try:
+        cv2.imwrite(temp_filename, img)
         result = client.infer(temp_filename, model_id=MODEL_ID)
         return result
+    except Exception as e:
+        print(f"Roboflow Error: {e}")
+        return {}
     finally:
         if os.path.exists(temp_filename):
-            os.remove(temp_filename)
+            try:
+                os.remove(temp_filename)
+            except: pass
 
 async def detect_plate_real(frame_bytes: bytes) -> Dict[str, Any]:
     """
-    Real implementation of plate detection using Roboflow + Tesseract.
-    Returns: {"found": bool, "plate": str, "coords": str}
+    Real implementation using Roboflow (Detection) + EasyOCR (Recognition).
     """
     try:
         loop = asyncio.get_event_loop()
@@ -83,24 +95,39 @@ async def detect_plate_real(frame_bytes: bytes) -> Dict[str, Any]:
         if img is None:
             return {"found": False, "plate": "0", "coords": "0"}
 
-        # Run Inference in Thread
+        # 1. Run Detection (Roboflow)
         result = await loop.run_in_executor(None, run_roboflow_inference_sync, img)
         
-        if 'predictions' in result and result['predictions']:
+        if result and 'predictions' in result and result['predictions']:
             best_p = result['predictions'][0]
-            bbox = (best_p['x'], best_p['y'], best_p['width'], best_p['height'])
             
-            # Run OCR in Thread
-            plate_text, confidence = await loop.run_in_executor(None, extract_plate_text_sync, img, bbox)
+            # Extract coordinates
+            x, y, w, h = best_p['x'], best_p['y'], best_p['width'], best_p['height']
+            height, width = img.shape[:2]
             
-            if plate_text:
-                coords = f"{int(best_p['x'])},{int(best_p['y'])}"
-                return {
-                    "found": True,
-                    "plate": plate_text,
-                    "coords": coords,
-                    "confidence": confidence
-                }
+            # Safe Crop with padding
+            pad = 5
+            x1 = max(0, int(x - w/2) - pad)
+            y1 = max(0, int(y - h/2) - pad)
+            x2 = min(width, int(x + w/2) + pad)
+            y2 = min(height, int(y + h/2) + pad)
+            
+            plate_crop = img[y1:y2, x1:x2]
+            
+            if plate_crop.size > 0:
+                # 2. Run Recognition (EasyOCR)
+                # Run in thread executor
+                plate_text, confidence = await loop.run_in_executor(None, run_easy_ocr_sync, plate_crop)
+                
+                if plate_text:
+                    coords = f"{int(x)},{int(y)}"
+                    return {
+                        "found": True,
+                        "plate": plate_text,
+                        "coords": coords,
+                        "confidence": float(confidence),
+                        "ocr_backend": "EasyOCR"
+                    }
 
     except Exception as e:
         print(f"Error in detect_plate_real: {e}")
