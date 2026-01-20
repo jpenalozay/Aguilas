@@ -1,116 +1,111 @@
+
 """
-Eagle-Eye Backend - FastAPI WebSocket Server
-Handles real-time video frame analysis via WebSocket connections.
+Eagle-Eye Backend - FastAPI WebRTC Server
 """
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Set
+import os
 import json
 import logging
-from core.analyzer import analyze_frame
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from core.webrtc_track import DetectionStreamTrack
 
-# Configure logging
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Eagle-Eye Backend", version="1.0.0")
+app = FastAPI(title="Eagle-Eye WebRTC Backend")
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-class ConnectionManager:
-    """Manages active WebSocket connections."""
-    
-    def __init__(self):
-        self.active_connections: Set[WebSocket] = set()
-    
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.add(websocket)
-        logger.info(f"Client connected. Total connections: {len(self.active_connections)}")
-    
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.discard(websocket)
-        logger.info(f"Client disconnected. Total connections: {len(self.active_connections)}")
-    
-    async def send_json(self, websocket: WebSocket, data: dict):
-        await websocket.send_json(data)
-
-
-manager = ConnectionManager()
-
+# Global peer connections (in production usage, manage strictly)
+pcs = set()
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
-    return {
-        "service": "Eagle-Eye Backend",
-        "status": "online",
-        "version": "1.0.0",
-        "active_connections": len(manager.active_connections)
-    }
+    return {"status": "online", "mode": "WebRTC"}
 
+@app.post("/offer")
+async def offer(request: Request):
+    """
+    WebRTC Signaling Endpoint.
+    Client sends SDP Offer -> Server responds with SDP Answer.
+    """
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
-@app.websocket("/ws/stream")
-async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time frame processing.
-    
-    Protocol:
-    - Client sends: {"frame": "base64_encoded_image"}
-    - Server responds: {"status": "success", "detections": {...}}
-    """
-    await manager.connect(websocket)
-    
-    try:
-        while True:
-            # Receive frame data from client
-            data = await websocket.receive_text()
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+
+    # Note: We create a data channel handle here? 
+    # Usually client creates DataChannel. We handle the event.
+    data_channel_ref = {"channel": None}
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        logger.info(f"DataChannel received: {channel.label}")
+        data_channel_ref["channel"] = channel
+        
+        @channel.on("message")
+        def on_message(message):
+            # Client can send config/commands here
+            pass
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        logger.info(f"Connection state: {pc.connectionState}")
+        if pc.connectionState == "failed":
+            await pc.close()
+            pcs.discard(pc)
+
+    @pc.on("track")
+    def on_track(track):
+        logger.info(f"Track received: {track.kind}")
+        if track.kind == "video":
+            # Hijack the track!
+            # We wrap the incoming track with our processing track
+            # And add it back to the PeerConnection to be sent back (Loopback)
+            # OR just consume it. User request implies we process it. 
+            # If client displays local video, we don't need to send it back.
+            # But let's create the processor track and consume it.
             
-            try:
-                payload = json.loads(data)
-                frame_data = payload.get("frame")
-                
-                if not frame_data:
-                    await manager.send_json(websocket, {
-                        "status": "error",
-                        "message": "No frame data provided"
-                    })
-                    continue
-                
-                # Process frame with parallel detection
-                result = await analyze_frame(frame_data)
-                
-                # Send results back to client
-                await manager.send_json(websocket, result)
-                
-            except json.JSONDecodeError:
-                await manager.send_json(websocket, {
-                    "status": "error",
-                    "message": "Invalid JSON format"
-                })
-            except Exception as e:
-                logger.error(f"Error processing frame: {str(e)}")
-                await manager.send_json(websocket, {
-                    "status": "error",
-                    "message": str(e)
-                })
-    
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        logger.info("WebSocket disconnected normally")
-    except Exception as e:
-        manager.disconnect(websocket)
-        logger.error(f"WebSocket error: {str(e)}")
+            local_video = DetectionStreamTrack(
+                track=track, 
+                data_channel=data_channel_ref["channel"] # Might be None if not established yet
+            )
+            # We "add" it to PC so the loop runs, even if we don't send it back?
+            # aiortc usually needs a consumer.
+            # If we act as a server that just analyzes, we can use Blackhole or just iterate recv()
+            
+            # Hack: Add it as a sender so aiortc drives the pump
+            pc.addTrack(local_video)
 
+            # Important: Update the data channel ref inside the track 
+            # because data channel might open AFTER track negotiation?
+            # Actually, standard is: Signal -> Connect -> DTLS -> DataChannel/Media.
+            
+            @local_video.track.on("ended")
+            async def on_ended():
+                logger.info("Track ended")
+
+    # Handle the offer
+    await pc.setRemoteDescription(offer)
+
+    # Create answer
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    return {
+        "sdp": pc.localDescription.sdp,
+        "type": pc.localDescription.type
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
